@@ -750,6 +750,44 @@ class TestApsAlertEncoder(object):
         check_encoding(msg, expected)
 
 
+class TestTimeout(object):
+
+    @classmethod
+    def setup_class(cls):
+        cred = testutils.MockCredential()
+        firebase_admin.initialize_app(cred, {'httpTimeout': 4, 'projectId': 'explicit-project-id'})
+
+    @classmethod
+    def teardown_class(cls):
+        testutils.cleanup_apps()
+
+    def setup(self):
+        app = firebase_admin.get_app()
+        self.fcm_service = messaging._get_messaging_service(app)
+        self.recorder = []
+
+    def test_send(self):
+        self.fcm_service._client.session.mount(
+            'https://fcm.googleapis.com',
+            testutils.MockAdapter(json.dumps({'name': 'message-id'}), 200, self.recorder))
+        msg = messaging.Message(topic='foo')
+        messaging.send(msg)
+        assert len(self.recorder) == 1
+        assert self.recorder[0]._extra_kwargs['timeout'] == 4
+
+    def test_topic_management_timeout(self):
+        self.fcm_service._client.session.mount(
+            'https://iid.googleapis.com',
+            testutils.MockAdapter(
+                json.dumps({'results': [{}, {'error': 'error_reason'}]}),
+                200,
+                self.recorder)
+        )
+        messaging.subscribe_to_topic(['1'], 'a')
+        assert len(self.recorder) == 1
+        assert self.recorder[0]._extra_kwargs['timeout'] == 4
+
+
 class TestSend(object):
 
     _DEFAULT_RESPONSE = json.dumps({'name': 'message-id'})
@@ -817,6 +855,7 @@ class TestSend(object):
         assert len(recorder) == 1
         assert recorder[0].method == 'POST'
         assert recorder[0].url == self._get_url('explicit-project-id')
+        assert recorder[0]._extra_kwargs['timeout'] is None
         body = {'message': messaging._MessagingService.encode_message(msg)}
         assert json.loads(recorder[0].body.decode()) == body
 
@@ -849,6 +888,26 @@ class TestSend(object):
             messaging.send(msg)
         assert str(excinfo.value) == 'test error'
         assert str(excinfo.value.code) == 'invalid-argument'
+        assert len(recorder) == 1
+        assert recorder[0].method == 'POST'
+        assert recorder[0].url == self._get_url('explicit-project-id')
+        body = {'message': messaging._MessagingService.JSON_ENCODER.default(msg)}
+        assert json.loads(recorder[0].body.decode()) == body
+
+    @pytest.mark.parametrize('status', HTTP_ERRORS)
+    def test_send_canonical_error_code(self, status):
+        payload = json.dumps({
+            'error': {
+                'status': 'NOT_FOUND',
+                'message': 'test error'
+            }
+        })
+        _, recorder = self._instrument_messaging_service(status=status, payload=payload)
+        msg = messaging.Message(topic='foo')
+        with pytest.raises(messaging.ApiCallError) as excinfo:
+            messaging.send(msg)
+        assert str(excinfo.value) == 'test error'
+        assert str(excinfo.value.code) == 'registration-token-not-registered'
         assert len(recorder) == 1
         assert recorder[0].method == 'POST'
         assert recorder[0].url == self._get_url('explicit-project-id')
